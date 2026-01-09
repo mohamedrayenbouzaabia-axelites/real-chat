@@ -58,7 +58,12 @@ function ConversationsPageInner() {
   const [sidebarWidth, setSidebarWidth] = useState(350); // Default sidebar width in pixels
   const [isResizing, setIsResizing] = useState(false);
   const [userPublicId, setUserPublicId] = useState<string>('');
+  const [isChangingConversation, setIsChangingConversation] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [wsConnectionStatus, setWsConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'error'>('disconnected');
+  const messagesCacheRef = useRef<Map<string, Message[]>>(new Map()); // Cache messages per conversation
+  const lastLoadedConversationIdRef = useRef<string | null>(null); // Track last loaded conversation to prevent duplicate loads
 
   // Derive user from authUser
   const user: User | null = authUser ? {
@@ -73,34 +78,31 @@ function ConversationsPageInner() {
       return;
     }
 
-    // Fetch user's public ID
-    const fetchPublicId = async () => {
+    const loadData = async () => {
       try {
-        const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/auth/me`, {
+        // Fetch user's public ID
+        const publicIdResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/auth/me`, {
           headers: {
             'Authorization': `Bearer ${token}`,
           },
         });
-        if (response.ok) {
-          const data = await response.json();
+        if (publicIdResponse.ok) {
+          const data = await publicIdResponse.json();
           if (data.user?.publicId) {
             setUserPublicId(data.user.publicId);
           }
         }
+
+        // Fetch conversations
+        await fetchConversations();
       } catch (err) {
-        console.error('Failed to fetch public ID:', err);
+        console.error('Failed to load initial data:', err);
+      } finally {
+        setLoading(false);
       }
     };
 
-    fetchPublicId();
-
-    try {
-      fetchConversations();
-    } catch (err) {
-      console.error('Failed to load conversations:', err);
-    } finally {
-      setLoading(false);
-    }
+    loadData();
   }, [authUser, token]);
 
   // Load conversation when ID is in URL, or auto-select first conversation
@@ -109,22 +111,31 @@ function ConversationsPageInner() {
 
     if (params.id) {
       // Load the conversation from URL
-      const conv = conversations.find(c => c.id === params.id);
-      if (conv) {
+      const id = Array.isArray(params.id) ? params.id[0] : params.id;
+      const conv = conversations.find(c => c.id === id);
+
+      // Only load if this is a different conversation than the last loaded one
+      if (conv && conv.id !== lastLoadedConversationIdRef.current) {
+        console.log(`📂 Loading conversation ${id} (previous: ${lastLoadedConversationIdRef.current})`);
         setSelectedConversation(conv);
         selectedConversationRef.current = conv;
-        fetchMessages(params.id);
+        lastLoadedConversationIdRef.current = conv.id;
+        fetchMessages(id);
+      } else {
+        console.log(`⏭️ Skipping conversation ${id} - already loaded`);
       }
     } else if (!selectedConversation && conversations.length > 0) {
       // Auto-select first conversation if no ID in URL and nothing selected
       const firstConv = conversations[0];
+      console.log(`📂 Auto-selecting first conversation ${firstConv.id}`);
       setSelectedConversation(firstConv);
       selectedConversationRef.current = firstConv;
+      lastLoadedConversationIdRef.current = firstConv.id;
       fetchMessages(firstConv.id);
-      // Update URL without reload
-      router.replace(`/conversations/${firstConv.id}`, { scroll: false });
+      // Update URL without triggering Next.js router
+      window.history.replaceState({}, '', `/conversations/${firstConv.id}`);
     }
-  }, [params.id, conversations]);
+  }, [params.id]); // Only re-run when URL param changes, not when conversations update
 
   // WebSocket connection for real-time updates (connect only once)
   useEffect(() => {
@@ -142,6 +153,9 @@ function ConversationsPageInner() {
       // Connect to WebSocket
       const wsUrl = `ws://localhost:3001/ws?token=${token}`;
       console.log('WebSocket URL:', wsUrl);
+
+      setWsConnectionStatus('connecting');
+
       const ws = new WebSocket(wsUrl);
 
       // Store in global scope
@@ -150,6 +164,12 @@ function ConversationsPageInner() {
 
       ws.onopen = () => {
         console.log('✅ WebSocket connected successfully');
+        setWsConnectionStatus('connected');
+        // Clear any pending reconnect timeout
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
+          reconnectTimeoutRef.current = null;
+        }
       };
 
       ws.onmessage = (event) => {
@@ -161,6 +181,13 @@ function ConversationsPageInner() {
             case 'new_message':
               console.log('📨 New message received for conversation:', data.payload.conversationId);
               console.log('Current conversation (from ref):', selectedConversationRef.current?.id);
+
+              // Update cache for this conversation
+              const cachedMsgs = messagesCacheRef.current.get(data.payload.conversationId) || [];
+              if (!cachedMsgs.some(m => m.id === data.payload.message.id)) {
+                messagesCacheRef.current.set(data.payload.conversationId, [...cachedMsgs, data.payload.message]);
+              }
+
               // Add new message to the list if we're viewing that conversation
               if (selectedConversationRef.current?.id === data.payload.conversationId) {
                 console.log('✅ Adding message to UI:', data.payload.message);
@@ -226,17 +253,19 @@ function ConversationsPageInner() {
 
       ws.onerror = (error) => {
         console.error('❌ WebSocket error:', error);
+        setWsConnectionStatus('error');
       };
 
       ws.onclose = (event) => {
         console.log('🔌 WebSocket disconnected:', event.code, event.reason);
         (window as any).globalWebSocket = null;
         wsRef.current = null;
+        setWsConnectionStatus('disconnected');
 
         // Auto-reconnect if it wasn't intentionally closed
         if (event.code !== 1000) {
           console.log('🔄 Attempting to reconnect in 3 seconds...');
-          setTimeout(() => {
+          reconnectTimeoutRef.current = setTimeout(() => {
             if (typeof window !== 'undefined' && !(window as any).globalWebSocket) {
               console.log('🔄 Reconnecting...');
               if (token) {
@@ -269,6 +298,13 @@ function ConversationsPageInner() {
             case 'new_message':
               console.log('📨 New message received for conversation:', data.payload.conversationId);
               console.log('Current conversation (from ref):', selectedConversationRef.current?.id);
+
+              // Update cache for this conversation
+              const cachedMsgs = messagesCacheRef.current.get(data.payload.conversationId) || [];
+              if (!cachedMsgs.some(m => m.id === data.payload.message.id)) {
+                messagesCacheRef.current.set(data.payload.conversationId, [...cachedMsgs, data.payload.message]);
+              }
+
               // Add new message to the list if we're viewing that conversation
               if (selectedConversationRef.current?.id === data.payload.conversationId) {
                 console.log('✅ Adding message to UI:', data.payload.message);
@@ -380,14 +416,28 @@ function ConversationsPageInner() {
       if (response.ok) {
         const data = await response.json();
         setConversations(data.conversations || []);
+        console.log(`✅ Loaded ${data.conversations?.length || 0} conversations`);
+      } else {
+        const errorData = await response.json().catch(() => ({}));
+        console.error('❌ Failed to fetch conversations:', response.status, errorData);
+        setError(errorData.message || 'Failed to load conversations');
       }
     } catch (err) {
-      console.error('Failed to fetch conversations:', err);
+      console.error('❌ Failed to fetch conversations:', err);
+      setError('Failed to connect to server');
     }
   };
 
   const fetchMessages = async (conversationId: string) => {
     try {
+      // Check if messages are already cached
+      const cachedMessages = messagesCacheRef.current.get(conversationId);
+      if (cachedMessages) {
+        console.log(`♻️ Using cached messages for conversation ${conversationId}`);
+        setMessages(cachedMessages);
+        return;
+      }
+
       const response = await fetch(`http://localhost:3001/api/conversations/${conversationId}/messages`, {
         headers: {
           ...getAuthHeader(),
@@ -396,7 +446,11 @@ function ConversationsPageInner() {
 
       if (response.ok) {
         const data = await response.json();
-        setMessages(data.messages || []);
+        const messages = data.messages || [];
+        setMessages(messages);
+        // Cache the messages
+        messagesCacheRef.current.set(conversationId, messages);
+        console.log(`✅ Fetched and cached ${messages.length} messages for conversation ${conversationId}`);
       }
     } catch (err) {
       console.error('Failed to fetch messages:', err);
@@ -404,10 +458,25 @@ function ConversationsPageInner() {
   };
 
   const handleSelectConversation = (conversation: Conversation) => {
+    // Don't do anything if clicking the same conversation
+    if (conversation.id === selectedConversation?.id) {
+      console.log(`⏭️ Already on conversation ${conversation.id}, skipping`);
+      return;
+    }
+
+    console.log(`🖱️ Clicked conversation ${conversation.id}`);
+    setIsChangingConversation(true);
     setSelectedConversation(conversation);
     selectedConversationRef.current = conversation;
-    router.push(`/conversations/${conversation.id}`);
-    fetchMessages(conversation.id);
+    lastLoadedConversationIdRef.current = conversation.id;
+
+    // NO router navigation - pure client-side state update
+    // Just update URL for bookmarking/sharing without triggering navigation
+    window.history.replaceState({}, '', `/conversations/${conversation.id}`);
+
+    fetchMessages(conversation.id).finally(() => {
+      setIsChangingConversation(false);
+    });
   };
 
   const handleStartConversation = async () => {
@@ -592,6 +661,16 @@ function ConversationsPageInner() {
             </div>
           </div>
           <div className="flex items-center space-x-2">
+            {/* Refresh Button */}
+            <button
+              onClick={() => fetchConversations()}
+              className="p-2 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-full transition-colors"
+              title="Refresh conversations"
+            >
+              <svg className="w-5 h-5 text-gray-600 dark:text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+            </button>
             {/* User Avatar with Plus */}
             <button
               onClick={() => setShowNewChatModal(true)}
@@ -638,7 +717,15 @@ function ConversationsPageInner() {
 
         {/* Conversations List */}
         <div className="flex-1 overflow-y-auto">
-          {conversations.length === 0 ? (
+          {loading ? (
+            <div className="flex flex-col items-center justify-center h-full text-gray-500 dark:text-gray-400 p-8">
+              <svg className="w-8 h-8 mb-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <p className="text-center text-sm">Loading conversations...</p>
+            </div>
+          ) : conversations.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-gray-500 dark:text-gray-400 p-8">
               <svg className="w-16 h-16 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
@@ -696,14 +783,23 @@ function ConversationsPageInner() {
           {/* Chat Navbar */}
           <div className="bg-gray-50 dark:bg-gray-800 px-4 py-2 flex items-center justify-between border-b border-gray-200 dark:border-gray-700 shadow-sm">
             <div className="flex items-center space-x-3">
-              <div className="w-10 h-10 bg-green-100 dark:bg-green-900 rounded-full flex items-center justify-center">
+              <div className="w-10 h-10 bg-green-100 dark:bg-green-900 rounded-full flex items-center justify-center relative">
                 <span className="text-green-600 dark:text-green-400 font-semibold text-lg">
                   {selectedConversation.other_username.charAt(0).toUpperCase()}
                 </span>
+                {isChangingConversation && (
+                  <div className="absolute inset-0 bg-white dark:bg-gray-800 rounded-full animate-ping opacity-20"></div>
+                )}
               </div>
               <div>
-                <h1 className="font-semibold text-gray-900 dark:text-white">
+                <h1 className="font-semibold text-gray-900 dark:text-white flex items-center gap-2">
                   {selectedConversation.other_username}
+                  {isChangingConversation && (
+                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                  )}
                 </h1>
                 <p className="text-xs text-gray-500 dark:text-gray-400 font-mono">
                   {selectedConversation.other_public_id}
@@ -711,6 +807,32 @@ function ConversationsPageInner() {
               </div>
             </div>
             <div className="flex items-center space-x-2">
+              {/* WebSocket Connection Status Indicator */}
+              <div
+                className="flex items-center space-x-1 px-2 py-1 rounded-full text-xs"
+                title={`WebSocket: ${wsConnectionStatus}`}
+              >
+                <div
+                  className={`w-2 h-2 rounded-full ${
+                    wsConnectionStatus === 'connected'
+                      ? 'bg-green-500 animate-pulse'
+                      : wsConnectionStatus === 'connecting'
+                      ? 'bg-yellow-500 animate-pulse'
+                      : wsConnectionStatus === 'error'
+                      ? 'bg-red-500'
+                      : 'bg-gray-400'
+                  }`}
+                />
+                <span className="text-gray-600 dark:text-gray-400 hidden sm:inline">
+                  {wsConnectionStatus === 'connected'
+                    ? 'Live'
+                    : wsConnectionStatus === 'connecting'
+                    ? 'Connecting...'
+                    : wsConnectionStatus === 'error'
+                    ? 'Error'
+                    : 'Offline'}
+                </span>
+              </div>
               <button className="p-2 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-full transition-colors">
                 <svg className="w-6 h-6 text-gray-600 dark:text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -767,11 +889,11 @@ function ConversationsPageInner() {
                           >
                             {/* Reply Preview */}
                             {message.reply_to_content && (
-                              <div className={`mb-2 pb-2 border-l-2 bg-gray-400 dark:bg-gray-700 rounded-[10px] bg-opacity-20 ${
+                              <div className={`mb-2 pb-2 border-l-4 bg-gray-400 dark:bg-gray-700 rounded-[5px] bg-opacity-20 ${
                                 isOwn ? 'border-green-400' : 'border-gray-400'
                               } pl-2 opacity-80`}>
-                                <div className="text-xs opacity-70 mb-1">
-                                  {message.reply_to_sender_id === user?.userId ? 'You' : selectedConversation?.other_username}
+                                <div className="text-xs mb-1 font-semibold" style={isOwn ?{ color: "rgba(0, 0, 0, 1)" }: { color: "rgb(74, 222, 128)" }}>
+                                  {message.reply_to_sender_id === user?.userId ? 'You' : (selectedConversation?.other_username?.charAt(0).toUpperCase() + selectedConversation.other_username.slice(1) || 'Unknown')} 
                                 </div>
                                 <div className="text-xs truncate opacity-90">
                                   {message.reply_to_content?.ciphertext || '(No content)'}
@@ -899,8 +1021,17 @@ function ConversationsPageInner() {
             {/* Error Message */}
             {error && (
               <div className="px-4 pb-2">
-                <div className="p-3 bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-800 rounded-lg">
+                <div className="p-3 bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-800 rounded-lg flex items-center justify-between">
                   <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+                  <button
+                    onClick={() => {
+                      setError(null);
+                      fetchConversations();
+                    }}
+                    className="ml-3 px-3 py-1 text-xs bg-red-200 dark:bg-red-800 text-red-800 dark:text-red-200 rounded hover:bg-red-300 dark:hover:bg-red-700 transition-colors"
+                  >
+                    Retry
+                  </button>
                 </div>
               </div>
             )}
@@ -977,9 +1108,21 @@ function ConversationsPageInner() {
               </div>
             </div>
           </div>
+        ) : (
+          // Placeholder when no conversation is selected
+          <div className="hidden md:flex flex-1 flex-col bg-gray-100 dark:bg-gray-900 items-center justify-center">
+            <div className="text-center text-gray-500 dark:text-gray-400">
+              <svg className="w-24 h-24 mx-auto mb-4 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+              </svg>
+              <h3 className="text-xl font-semibold mb-2">Select a conversation</h3>
+              <p className="text-sm">Choose a conversation from the sidebar to start chatting</p>
+            </div>
+          </div>
+        )}
 
-          {/* New Chat Modal */}
-          {showNewChatModal && (
+      {/* New Chat Modal */}
+      {showNewChatModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
           <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-md w-full">
             <div className="p-6">
