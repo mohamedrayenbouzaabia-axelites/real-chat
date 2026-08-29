@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(timeout:*)",
+      "Bash(lsof:*)",
+      "Bash(xargs kill:*)",
+      "Bash(curl:*)",
+      "Bash(npm run migrate:*)",
+      "Bash(DATABASE_URL=\"postgresql://chatuser:changeme@localhost:5432/realchat\" npm run migrate:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npx tsx:*)",
+      "Bash(node:*)",
+      "Bash(npm run create-tables:*)",
+      "Bash(redis-cli:*)",
+      "Bash(docker start:*)",
+      "Bash(docker port:*)",
+      "Bash(npx eslint:*)"
+    ]
+  }
+}

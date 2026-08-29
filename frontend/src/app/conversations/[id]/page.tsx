@@ -740,7 +740,7 @@ function ConversationsPageInner() {
                 onClick={() => handleSelectConversation(conversation)}
                 className={`flex items-center px-4 py-3 cursor-pointer transition-colors border-b border-gray-100 dark:border-gray-700 ${
                   selectedConversation?.id === conversation.id
-                    ? 'bg-green-50 dark:bg-green-900/20 hover:bg-green-100 dark:hover:bg-green-900/30'
+                    ? 'bg-green-50 dark:bg-green-800/10 hover:bg-green-100 dark:hover:bg-green-900/30'
                     : 'hover:bg-gray-100 dark:hover:bg-gray-700'
                 }`}
               >
